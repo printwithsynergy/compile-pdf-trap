@@ -168,6 +168,16 @@ class TrapPolicy(BaseModel):
             "resolved from CODEX_API_URL (default: http://localhost:8001)."
         ),
     )
+    auto_detect_zones: bool = Field(
+        default=True,
+        description=(
+            "When true and no trap zones remain after all other resolution "
+            "(policy declaration + codex_extract), automatically detect "
+            "candidate ink-adjacency zones from the PDF's content stream "
+            "using the conservative extractor. Set false to suppress "
+            "auto-detection and run only against explicitly declared zones."
+        ),
+    )
 
 
 class TrapPolicyRoot(RootModel[TrapPolicy]):

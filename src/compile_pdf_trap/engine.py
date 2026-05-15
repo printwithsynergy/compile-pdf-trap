@@ -26,6 +26,7 @@ from compile_pdf_trap.engines.pure_python import (
     TrapEngineError,
     TrapEngineResult,
 )
+from compile_pdf_trap.extract import auto_trap_zones
 from compile_pdf_trap.policy_schema import EngineSelector, TrapPolicy, TrapZone
 
 logger = logging.getLogger(__name__)
@@ -59,13 +60,14 @@ def apply_policy(input_bytes: bytes, policy: TrapPolicy) -> TrapResult:
     """Apply ``policy`` to ``input_bytes`` and return the trapped PDF
     plus a populated trap-diff artifact.
 
-    When ``policy.trap_zones_source == 'codex_extract'`` and
-    ``policy.codex_job_id`` is set, fetches AI-detected ink-boundary
-    candidates from the codex API (confidence ≥ 0.7), merges them with
-    any explicitly declared ``policy.trap_zones``, and runs the engine
-    against the effective combined zone list.
+    Zone resolution order:
+    1. Codex AI zones (when ``trap_zones_source='codex_extract'`` + ``codex_job_id``).
+    2. Operator-declared ``policy.trap_zones`` (always augments/overrides codex zones).
+    3. Content-stream auto-detection (when ``auto_detect_zones=True`` and step 1+2 yield no zones).
     """
     effective_policy = policy
+    auto_detected_count = 0
+
     if policy.trap_zones_source == "codex_extract" and policy.codex_job_id:
         codex_zones = _fetch_codex_zones(policy.codex_job_id)
         if codex_zones:
@@ -78,6 +80,17 @@ def apply_policy(input_bytes: bytes, policy: TrapPolicy) -> TrapResult:
                 codex_zone_count=len(codex_zones),
                 total_zone_count=len(merged),
             )
+
+    if not effective_policy.trap_zones and effective_policy.auto_detect_zones:
+        detected = auto_trap_zones(input_bytes)
+        if detected:
+            effective_policy = effective_policy.model_copy(update={"trap_zones": detected})
+            auto_detected_count = len(detected)
+            logger.info(
+                "trap_engine.auto_zones_detected",
+                zone_count=auto_detected_count,
+            )
+
     engine_name = _resolve_engine(effective_policy.engine)
     engine = _ENGINES.get(engine_name)
     if engine is None:
@@ -86,7 +99,7 @@ def apply_policy(input_bytes: bytes, policy: TrapPolicy) -> TrapResult:
             "expected one of pure_python | ghostscript | external"
         )
     result = engine.apply(input_bytes, effective_policy)
-    diff = _build_trap_diff(effective_policy, engine_name, result)
+    diff = _build_trap_diff(effective_policy, engine_name, result, auto_detected_count)
     return TrapResult(
         output_bytes=result.output_bytes,
         pdf_sha256=result.pdf_sha256,
@@ -191,6 +204,7 @@ def _build_trap_diff(
     policy: TrapPolicy,
     engine_name: str,
     result: TrapEngineResult,
+    auto_detected_zone_count: int = 0,
 ) -> dict[str, object]:
     """Produce a JSON-serializable trap-diff record per spec §5.7."""
     return {
@@ -199,6 +213,7 @@ def _build_trap_diff(
         "engine_fingerprint": result.engine_fingerprint,
         "policy_default_trap_width_pt": policy.default_trap_width_pt,
         "delta_e_tolerance": policy.delta_e_tolerance,
+        "auto_detected_zone_count": auto_detected_zone_count,
         "operations": [_op_to_dict(op) for op in result.operations],
     }
 
