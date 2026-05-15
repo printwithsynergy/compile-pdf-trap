@@ -30,6 +30,7 @@ from codex_pdf.geom import Box, Path, polygon_offset
 
 from compile_pdf_trap.policy_schema import (
     InkPairRule,
+    NeutralDensitySource,
     TrapDirection,
     TrapPolicy,
     TrapZone,
@@ -152,19 +153,21 @@ def _index_rules(policy: TrapPolicy) -> dict[tuple[str, str], InkPairRule]:
 def _resolve_direction(
     zone: TrapZone, rule: InkPairRule | None, policy: TrapPolicy
 ) -> TrapDirection:
-    """``auto`` resolves to ``spread`` when ``from_ink`` is the lighter
-    of the pair (lower neutral density), else ``choke``.
+    """Resolve the effective spread/choke direction for a zone.
 
-    For v1 we approximate neutral density with luminance derived from
-    the resolved RGB triplet (709 weights). Operator overrides win.
+    Priority order:
+    1. Explicit per-pair rule direction (non-"auto") always wins.
+    2. Policy-level ``spread_choke`` override (non-"auto") wins over density.
+    3. Density-based auto: Lab L* from codex when
+       ``neutral_density_source="codex_extract"`` (default); RGB luminance
+       approximation when ``"operator"`` (operator declares rules; auto
+       pairs fall back gracefully).
     """
     if rule is not None and rule.direction != "auto":
         return rule.direction
-    if rule is not None and rule.direction == "auto":
-        return _density_direction(zone.from_ink, zone.to_ink)
-    # No rule for this pair: derive direction from densities.
-    _ = policy.neutral_density_source
-    return _density_direction(zone.from_ink, zone.to_ink)
+    if policy.spread_choke != "auto":
+        return policy.spread_choke
+    return _density_direction(zone.from_ink, zone.to_ink, policy.neutral_density_source)
 
 
 # Canonical process-ink colors. The Codex spot resolver hashes unknown
@@ -186,11 +189,30 @@ def _resolve_ink(ink_name: str) -> SpotSwatchResolution:
     return resolve_spot_swatch_color(ink_name, codex_intent=intent)
 
 
-def _density_direction(from_ink: str, to_ink: str) -> TrapDirection:
-    """Lower-luminance ink (darker) is the trap target; lighter spreads."""
-    from_lum = _luminance(_resolve_ink(from_ink).rgb)
-    to_lum = _luminance(_resolve_ink(to_ink).rgb)
-    return "spread" if from_lum > to_lum else "choke"
+def _density_direction(
+    from_ink: str,
+    to_ink: str,
+    source: NeutralDensitySource = "codex_extract",
+) -> TrapDirection:
+    """Lighter ink (lower neutral density) spreads into darker.
+
+    When ``source="codex_extract"`` (default), derives lightness from
+    the Lab L* value returned by codex's spot-color resolver (which
+    includes AI Lab enrichment for unknown ink names). When
+    ``source="operator"``, falls back to an RGB-luminance approximation
+    — this is the correct degraded-mode path when the operator declares
+    all important pairs explicitly and AI Lab values aren't needed.
+    """
+    from_res = _resolve_ink(from_ink)
+    to_res = _resolve_ink(to_ink)
+    if source == "codex_extract":
+        # Lab L* is the authoritative lightness signal; 0 = black, 100 = white.
+        from_l = from_res.lab[0] if from_res.lab else _luminance(from_res.rgb) / 255.0 * 100
+        to_l = to_res.lab[0] if to_res.lab else _luminance(to_res.rgb) / 255.0 * 100
+    else:
+        from_l = _luminance(from_res.rgb)
+        to_l = _luminance(to_res.rgb)
+    return "spread" if from_l > to_l else "choke"
 
 
 def _luminance(rgb: tuple[int, int, int]) -> float:

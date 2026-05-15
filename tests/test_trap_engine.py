@@ -135,3 +135,58 @@ def test_unknown_engine_in_env_rejected(simple_pdf: bytes, monkeypatch) -> None:
     policy = _policy()
     with pytest.raises(TrapEngineError, match="unknown trap engine"):
         apply_policy(simple_pdf, policy)
+
+
+def test_spread_choke_override_forces_direction(simple_pdf: bytes) -> None:
+    """Policy-level spread_choke='choke' forces all auto-pairs to choke
+    regardless of which ink is lighter."""
+    policy = TrapPolicy(
+        spread_choke="choke",
+        trap_zones=[
+            # Y is lighter than K — auto would spread, but override wins.
+            TrapZone(page_index=0, rect_pt=(50, 50, 100, 100), from_ink="Y", to_ink="K"),
+        ],
+    )
+    result = apply_policy(simple_pdf, policy)
+    assert result.operations[0].direction == "choke"
+
+
+def test_spread_choke_override_spread(simple_pdf: bytes) -> None:
+    """Policy-level spread_choke='spread' forces spread even when from_ink is darker."""
+    policy = TrapPolicy(
+        spread_choke="spread",
+        trap_zones=[
+            # K is darker than Y — auto would choke, but override wins.
+            TrapZone(page_index=0, rect_pt=(50, 50, 100, 100), from_ink="K", to_ink="Y"),
+        ],
+    )
+    result = apply_policy(simple_pdf, policy)
+    assert result.operations[0].direction == "spread"
+
+
+def test_explicit_rule_overrides_spread_choke(simple_pdf: bytes) -> None:
+    """Explicit per-pair rule direction takes precedence over spread_choke override."""
+    policy = TrapPolicy(
+        spread_choke="spread",
+        ink_pair_rules=[
+            InkPairRule(from_ink="Y", to_ink="K", width_pt=0.5, direction="choke"),
+        ],
+        trap_zones=[
+            TrapZone(page_index=0, rect_pt=(50, 50, 100, 100), from_ink="Y", to_ink="K"),
+        ],
+    )
+    result = apply_policy(simple_pdf, policy)
+    assert result.operations[0].direction == "choke"
+
+
+def test_neutral_density_source_operator_uses_luminance(simple_pdf: bytes) -> None:
+    """neutral_density_source='operator' falls back to RGB luminance; Y→K still spreads."""
+    policy = TrapPolicy(
+        neutral_density_source="operator",
+        trap_zones=[
+            TrapZone(page_index=0, rect_pt=(50, 50, 100, 100), from_ink="Y", to_ink="K"),
+        ],
+    )
+    result = apply_policy(simple_pdf, policy)
+    # Y has higher luminance than K under both RGB and Lab, so direction is unaffected.
+    assert result.operations[0].direction == "spread"

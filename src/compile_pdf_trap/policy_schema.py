@@ -93,6 +93,7 @@ class TrapZone(_Strict):
 NeutralDensitySource = Literal["codex_extract", "operator"]
 EngineSelector = Literal["auto", "pure_python", "ghostscript", "external"]
 TrapZonesSource = Literal["policy", "codex_extract"]
+SpreadChokeOverride = Literal["auto", "spread", "choke"]
 
 
 class TrapPolicy(BaseModel):
@@ -115,7 +116,26 @@ class TrapPolicy(BaseModel):
             "verify Layer 6 but still emit a diff record."
         ),
     )
-    neutral_density_source: NeutralDensitySource = Field(default="codex_extract")
+    neutral_density_source: NeutralDensitySource = Field(
+        default="codex_extract",
+        description=(
+            "Source for per-ink neutral density used to resolve 'auto' spread/choke "
+            "direction. 'codex_extract' uses Lab L* values from the codex spot-color "
+            "resolver (including AI Lab enrichment for unknown inks). 'operator' "
+            "requires explicit direction on all ink_pair_rules; 'auto' pairs with no "
+            "rule fall back to RGB-luminance approximation."
+        ),
+    )
+    spread_choke: SpreadChokeOverride = Field(
+        default="auto",
+        description=(
+            "Global spread/choke default applied to all zones whose ink_pair_rule "
+            "direction is 'auto' (or that have no ink_pair_rule). 'auto' defers to "
+            "neutral-density logic (lighter ink spreads). 'spread' or 'choke' forces "
+            "the direction for all auto-resolved pairs — useful when the operator "
+            "knows their press always spreads or always chokes regardless of density."
+        ),
+    )
     engine: EngineSelector = Field(
         default="auto",
         description=(
@@ -167,6 +187,7 @@ __all__ = [
     "EngineSelector",
     "InkPairRule",
     "NeutralDensitySource",
+    "SpreadChokeOverride",
     "TrapDirection",
     "TrapPolicy",
     "TrapPolicyRoot",
