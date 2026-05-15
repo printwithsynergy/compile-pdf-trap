@@ -26,8 +26,11 @@ fail the post-condition.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
+import logging
+import os
 from dataclasses import dataclass, field
 
 import pikepdf
@@ -35,6 +38,8 @@ from pikepdf import Name
 
 from compile_pdf_trap.engine import TrapResult, apply_policy
 from compile_pdf_trap.policy_schema import TrapPolicy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -45,6 +50,8 @@ class TrapVerifyResult:
     layer2_determinism: bool = False
     layer3_unchanged: bool = False
     layer6_delta_e: bool = False
+    layer7_visual: bool | None = None  # None = skipped (deps/env not available)
+    layer7_score: float | None = None  # mean visual quality score 0.0–1.0
     failures: list[str] = field(default_factory=list)
 
     @property
@@ -64,13 +71,25 @@ def verify_trap(
     policy: TrapPolicy,
     determinism_replay: bool = True,
     strict_delta_e: bool = False,
+    visual_verify: bool | None = None,
 ) -> TrapVerifyResult:
-    """Run all four post-condition layers and return a combined result."""
+    """Run all post-condition layers and return a combined result.
+
+    ``visual_verify`` controls Layer 7. When ``None`` (default), the
+    layer runs only when ``COMPILE_TRAP_VISUAL_VERIFY=1`` is set in the
+    environment and the required deps (PyMuPDF + anthropic) are available.
+    Pass ``True`` to force it; ``False`` to skip unconditionally.
+    """
     out = TrapVerifyResult()
     _layer1(input_bytes, result.output_bytes, policy, out)
     _layer2(input_bytes, result, policy, out, replay=determinism_replay)
     _layer3(input_bytes, result.output_bytes, out)
     _layer6(result, policy, out, strict=strict_delta_e)
+    run_visual = visual_verify
+    if run_visual is None:
+        run_visual = os.environ.get("COMPILE_TRAP_VISUAL_VERIFY", "").strip() == "1"
+    if run_visual:
+        _layer7(input_bytes, result, policy, out)
     return out
 
 
@@ -235,6 +254,139 @@ def _layer6(
             )
     else:
         out.layer6_delta_e = True
+
+
+# --- Layer 7 (visual verify) --------------------------------------------
+
+_L7_SYSTEM = (
+    "You are a print production quality inspector. You are given two page "
+    "renders — BEFORE trapping and AFTER trapping — and a list of trap zones "
+    "that were applied. Your job is to verify the trap application quality.\n\n"
+    "For each zone, assess:\n"
+    "1. Is a trap stroke visible at the expected boundary? (0 = not visible, "
+    "1 = clearly visible)\n"
+    "2. Does the stroke color look appropriate for the ink pair described? "
+    "(0 = wrong color, 1 = correct)\n"
+    "3. Is the stroke width reasonable — not too wide or too narrow? "
+    "(0 = bad, 1 = good)\n\n"
+    "Return ONLY valid JSON, no prose:\n"
+    '{"zones": [{"zone_index": <int>, "visible": <0..1>, '
+    '"color_ok": <0..1>, "width_ok": <0..1>}], "overall_score": <0..1>}.\n'
+    "If you cannot evaluate a zone (e.g. page does not render), omit it. "
+    "Be honest and conservative — do not award high scores unless the trap "
+    "is clearly present and correct."
+)
+
+
+def _layer7(
+    input_bytes: bytes,
+    result: TrapResult,
+    policy: TrapPolicy,
+    out: TrapVerifyResult,
+) -> None:
+    """Post-trap visual quality check via Claude vision."""
+    try:
+        import anthropic
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        logger.warning("trap_verify.layer7_skipped: missing dep %s", exc)
+        out.layer7_visual = None
+        return
+
+    api_key = os.environ.get("COMPILE_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.warning("trap_verify.layer7_skipped: no ANTHROPIC_API_KEY")
+        out.layer7_visual = None
+        return
+
+    pages_with_zones = sorted({z.page_index for z in policy.trap_zones})
+    if not pages_with_zones:
+        out.layer7_visual = True
+        out.layer7_score = 1.0
+        return
+
+    images_b64: list[tuple[str, str]] = []
+    for page_idx in pages_with_zones[:2]:  # cap at 2 pages per call
+        before_png = _render_page(input_bytes, page_idx, fitz)
+        after_png = _render_page(result.output_bytes, page_idx, fitz)
+        if before_png:
+            images_b64.append(("image/png", base64.b64encode(before_png).decode()))
+        if after_png:
+            images_b64.append(("image/png", base64.b64encode(after_png).decode()))
+
+    if not images_b64:
+        logger.warning("trap_verify.layer7_skipped: page render failed")
+        out.layer7_visual = None
+        return
+
+    zone_descriptions = "\n".join(
+        f"  zone {i}: page {z.page_index}, {z.from_ink} → {z.to_ink}"
+        for i, z in enumerate(policy.trap_zones)
+    )
+    prompt = (
+        f"The images show alternating BEFORE/AFTER renders for "
+        f"{len(pages_with_zones)} page(s).\n"
+        f"Trap zones applied:\n{zone_descriptions}\n\n"
+        "Evaluate each zone and return JSON as instructed."
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        content: list[anthropic.types.ContentBlockParam] = []
+        for mime, b64 in images_b64:
+            content.append({  # type: ignore[misc]
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64},
+            })
+        content.append({"type": "text", "text": prompt})  # type: ignore[misc]
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=_L7_SYSTEM,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = response.content[0].text if response.content else ""
+    except Exception as exc:
+        logger.warning("trap_verify.layer7_api_error: %s", exc)
+        out.layer7_visual = None
+        return
+
+    score = _parse_l7_score(raw)
+    out.layer7_score = score
+    out.layer7_visual = score >= 0.5
+    if not out.layer7_visual:
+        out.failures.append(f"L7: visual score {score:.2f} below 0.5 threshold")
+
+
+def _render_page(pdf_bytes: bytes, page_index: int, fitz: object) -> bytes:
+    """Render one page to PNG via PyMuPDF. Returns empty bytes on error."""
+    try:
+        import fitz as _fitz
+        with _fitz.open(stream=pdf_bytes, filetype="pdf") as doc:  # type: ignore[attr-defined]
+            if page_index >= doc.page_count or page_index < 0:
+                return b""
+            page = doc.load_page(page_index)
+            zoom = 150 / 72.0
+            mat = _fitz.Matrix(zoom, zoom)  # type: ignore[attr-defined]
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            return pix.tobytes("png")
+    except Exception:
+        logger.exception("trap_verify.render_failed page=%s", page_index)
+        return b""
+
+
+def _parse_l7_score(raw: str) -> float:
+    """Extract overall_score from Claude's JSON response; default 0.0 on parse error."""
+    import json
+    import re
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return 0.0
+    try:
+        data = json.loads(match.group())
+        return max(0.0, min(1.0, float(data.get("overall_score", 0.0))))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return 0.0
 
 
 __all__ = [

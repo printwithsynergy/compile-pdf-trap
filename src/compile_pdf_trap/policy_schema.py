@@ -92,6 +92,7 @@ class TrapZone(_Strict):
 
 NeutralDensitySource = Literal["codex_extract", "operator"]
 EngineSelector = Literal["auto", "pure_python", "ghostscript", "external"]
+TrapZonesSource = Literal["policy", "codex_extract"]
 
 
 class TrapPolicy(BaseModel):
@@ -130,6 +131,23 @@ class TrapPolicy(BaseModel):
             "viewers can toggle the layer on/off."
         ),
     )
+    trap_zones_source: TrapZonesSource = Field(
+        default="policy",
+        description=(
+            "When 'codex_extract', fetch AI-detected ink-boundary candidates "
+            "from the codex document identified by codex_job_id and merge them "
+            "into the effective zone list. Declared trap_zones still augment/"
+            "override codex zones. Requires codex_job_id to be set."
+        ),
+    )
+    codex_job_id: str | None = Field(
+        default=None,
+        description=(
+            "Codex document_id to read trap_zone_candidates from when "
+            "trap_zones_source='codex_extract'. The codex API URL is "
+            "resolved from CODEX_API_URL (default: http://localhost:8001)."
+        ),
+    )
 
 
 class TrapPolicyRoot(RootModel[TrapPolicy]):
@@ -153,5 +171,6 @@ __all__ = [
     "TrapPolicy",
     "TrapPolicyRoot",
     "TrapZone",
+    "TrapZonesSource",
     "trap_policy_json_schema",
 ]
